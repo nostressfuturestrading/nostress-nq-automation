@@ -1,0 +1,99 @@
+name: 📧 Automated Email Campaigns for US Traders
+
+on:
+  schedule:
+    # All times in UTC, optimized for US Eastern Time audience
+    - cron: '0 12 * * 2'   # Tuesday 7:00 AM ET (12:00 UTC) - Weekly Roundup
+    - cron: '30 11 * * 3'  # Wednesday 6:30 AM ET (11:30 UTC) - Mid-Week Alert  
+    - cron: '30 12 * * 4'  # Thursday 7:30 AM ET (12:30 UTC) - Featured Deals
+    - cron: '0 23 * * 0'   # Sunday 6:00 PM ET (23:00 UTC) - Weekend Prep
+  
+  # Allow manual triggering for testing
+  workflow_dispatch:
+    inputs:
+      campaign_type:
+        description: 'Campaign Type'
+        required: false
+        default: 'weekly_roundup'
+        type: choice
+        options:
+        - weekly_roundup
+        - midweek_alert  
+        - featured_deals
+        - weekend_prep
+        - branded_deals
+
+jobs:
+  send-automated-emails:
+    runs-on: ubuntu-latest
+    name: 🚀 Send Prop Firm Email Campaign
+    
+    steps:
+    - name: 📅 Determine Campaign Type
+      id: campaign
+      run: |
+        # Determine campaign type based on schedule or manual input
+        if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+          echo "type=${{ github.event.inputs.campaign_type }}" >> $GITHUB_OUTPUT
+          echo "name=Manual: ${{ github.event.inputs.campaign_type }}" >> $GITHUB_OUTPUT
+        else
+          # Determine based on day/time (UTC)
+          day=$(date -u +%u)  # 1=Monday, 7=Sunday
+          hour=$(date -u +%H)
+          minute=$(date -u +%M)
+          
+          if [ "$day" = "2" ] && [ "$hour" = "12" ] && [ "$minute" = "00" ]; then
+            echo "type=weekly_roundup" >> $GITHUB_OUTPUT
+            echo "name=Weekly Prop Firm Deals Roundup" >> $GITHUB_OUTPUT
+          elif [ "$day" = "3" ] && [ "$hour" = "11" ] && [ "$minute" = "30" ]; then
+            echo "type=midweek_alert" >> $GITHUB_OUTPUT  
+            echo "name=Mid-Week Trading Alert" >> $GITHUB_OUTPUT
+          elif [ "$day" = "4" ] && [ "$hour" = "12" ] && [ "$minute" = "30" ]; then
+            echo "type=featured_deals" >> $GITHUB_OUTPUT
+            echo "name=Thursday Featured Deals" >> $GITHUB_OUTPUT
+          elif [ "$day" = "7" ] && [ "$hour" = "23" ] && [ "$minute" = "00" ]; then
+            echo "type=weekend_prep" >> $GITHUB_OUTPUT
+            echo "name=Weekend Trading Prep" >> $GITHUB_OUTPUT
+          else
+            echo "type=branded_deals" >> $GITHUB_OUTPUT
+            echo "name=Fallback Campaign" >> $GITHUB_OUTPUT
+          fi
+        fi
+    
+    - name: 🎯 Send Email Campaign
+      run: |
+        echo "📧 Triggering campaign: ${{ steps.campaign.outputs.name }}"
+        echo "🕐 Execution time: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+        echo "⏰ US Eastern Time: $(TZ='America/New_York' date '+%Y-%m-%d %H:%M:%S ET')"
+        
+        # Call Cloudflare Pages automation API
+        response=$(curl -s -X POST \
+          "https://nostressnqfutures-trading.pages.dev/api/automation/trigger-campaign" \
+          -H "Content-Type: application/json" \
+          -d "{\"campaignType\":\"${{ steps.campaign.outputs.type }}\"}")
+        
+        echo "📊 API Response: $response"
+        
+        # Parse response to check success
+        success=$(echo "$response" | jq -r '.success // false')
+        sent=$(echo "$response" | jq -r '.sent // 0')
+        total=$(echo "$response" | jq -r '.total // 0')
+        
+        if [ "$success" = "true" ]; then
+          echo "✅ Campaign successful: $sent/$total emails sent"
+          echo "🎉 Campaign '${{ steps.campaign.outputs.name }}' completed successfully"
+        else
+          echo "❌ Campaign failed"
+          echo "Error: $(echo "$response" | jq -r '.message // "Unknown error"')"
+          exit 1
+        fi
+    
+    - name: 📈 Log Campaign Results  
+      if: always()
+      run: |
+        echo "📋 Campaign Summary:"
+        echo "   Type: ${{ steps.campaign.outputs.type }}"
+        echo "   Name: ${{ steps.campaign.outputs.name }}"  
+        echo "   Triggered: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+        echo "   US Time: $(TZ='America/New_York' date '+%Y-%m-%d %H:%M:%S ET')"
+        echo "   Status: $(if [ $? -eq 0 ]; then echo "✅ Success"; else echo "❌ Failed"; fi)"
