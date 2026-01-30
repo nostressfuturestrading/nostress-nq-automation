@@ -15,6 +15,7 @@ using NinjaTrader.Data;
 using NinjaTrader.Gui.Tools;
 using NinjaTrader.NinjaScript;
 using System.Diagnostics;
+using System.Security.Cryptography;
 #endregion
 
 // =======================================================================================
@@ -481,6 +482,9 @@ namespace NinjaTrader.NinjaScript.Indicators
             public DateTime LastTradeUtc;
             public DateTime LastDepthUpdateExchTs;
 
+            // Audit
+            public long ExchRegressCount;
+
             // Trackers
             public DateTime LastEmittedDomExchTs;
             public long LastEmittedDomSeq;
@@ -752,8 +756,11 @@ namespace NinjaTrader.NinjaScript.Indicators
         private static ManualResetEventSlim fusedWakeEvent = new ManualResetEventSlim(false);
 
         // [FIX] Global Monotonic Clock
+        // [FIX] Global Monotonic Clock
         private static readonly object GlobalClockLock = new object();
         private static DateTime GlobalLastUtc = DateTime.MinValue;
+        private static long MaxRingLag = 0;
+        private static int FusedPart = 1;
 
         public static DateTime NextGlobalUtc()
         {
@@ -785,22 +792,19 @@ namespace NinjaTrader.NinjaScript.Indicators
                     Interlocked.Increment(ref fusedDrops);
                     return;
                 }
+
+                long seq = Interlocked.Increment(ref GlobalSeq);
+
+                string instName = (Instrument != null) ? Instrument.FullName : "RECORDER";
+                var json = $"{{\"tag\":\"CONTROL\",\"inst\":\"{instName}\",\"type\":\"{type}\",\"reason\":\"{reason}\",\"global_seq\":{seq},\"ts\":\"{NextGlobalUtc():O}\"}}";
+
+                // PATCH 3 & 4: Fused Ring Buffer
+                ring[seq & MASK] = new FusedEntry {
+                    Json = json + "\n",
+                    Seq = seq,
+                    LocalTicks = Stopwatch.GetTimestamp()
+                };
             }
-
-            // long seq = Interlocked.Increment(ref GlobalSeq);
-
-            // PATCH: Added "inst" field to identify source (ES vs NQ)
-            // var json = $"{{\"tag\":\"CONTROL\",\"inst\":\"{Instrument.FullName}\",\"type\":\"{type}\",\"reason\":\"{reason}\",\"global_seq\":{seq},\"ts\":\"{NextGlobalUtc():O}\"}}";
-
-            // PATCH 3 & 4: Fused Ring Buffer
-            // if (WriteFused)
-            // {
-            //     ring[seq & MASK] = new FusedEntry {
-            //         Json = json + "\n",
-            //         Seq = seq,
-            //         LocalTicks = Stopwatch.GetTimestamp()
-            //     };
-            // }
         }
 
         // ==========================================================
@@ -1010,7 +1014,7 @@ namespace NinjaTrader.NinjaScript.Indicators
                                     // [FIX 3] GLOBALSEQ ASSIGNMENT (GATED)
                                     // Only assign valid sequence numbers if the book is actually ready.
                                     // This keeps the sequence monotonic starting from 1 with valid data.
-                                    if (WriteFused && bookReady && p.Tag != Tags.HEARTBEAT)
+                                    if (WriteFused && bookReady && d.ValidBookCount >= 100 && p.Tag != Tags.HEARTBEAT)
                                     {
                                         p.GlobalSeq = System.Threading.Interlocked.Increment(ref GlobalSeq);
                                     }
@@ -1056,7 +1060,7 @@ namespace NinjaTrader.NinjaScript.Indicators
 
                                     // [FIX 1] RING INSERT GATE (MANDATORY)
                                     // Prevents bad data from poisoning the ring buffer
-                                    if (WriteFused && bookReady && p.Tag != Tags.HEARTBEAT)
+                                    if (WriteFused && bookReady && d.ValidBookCount >= 100 && p.Tag != Tags.HEARTBEAT)
                                     {
                                         ring[p.GlobalSeq & MASK] = new FusedEntry
                                         {
@@ -1150,10 +1154,28 @@ namespace NinjaTrader.NinjaScript.Indicators
                         string sessionDate = NextGlobalUtc().ToString("yyyyMMdd", CultureInfo.InvariantCulture);
                         if (!string.IsNullOrEmpty(fusedDate)) sessionDate = fusedDate;
 
+                        long totalDrops = 0;
+                        long totalRegress = 0;
+                        if (dom != null) {
+                            foreach(var d in dom) {
+                                if(d!=null) {
+                                    totalDrops += d.DropsStructural;
+                                    totalRegress += d.ExchRegressCount;
+                                }
+                            }
+                        }
+
+                        long uptime = (long)(NextGlobalUtc() - sessionStartUtc).TotalSeconds;
+
                         string auditJson = "{\n" +
                             $"  \"fused_started\": {(fusedWriterReady ? "true" : "false")},\n" +
                             $"  \"fused_rows\": {fusedRowsWritten},\n" +
                             $"  \"fatal_errors\": {fatalErrorCount},\n" +
+                            $"  \"total_structural_drops\": {totalDrops},\n" +
+                            $"  \"total_exch_regress_count\": {totalRegress},\n" +
+                            $"  \"max_ring_lag\": {MaxRingLag},\n" +
+                            $"  \"total_fused_gap_skips\": {Interlocked.Read(ref fusedGapSkips)},\n" +
+                            $"  \"recorder_uptime_seconds\": {uptime},\n" +
                             $"  \"recorder_version\": \"{VERSION}\"\n" +
                             "}";
 
@@ -1234,9 +1256,21 @@ namespace NinjaTrader.NinjaScript.Indicators
         private void WriteMetadata(DomState d)
         {
             string metaPath = Path.Combine(d.Folder, $"{d.Symbol}_{d.Date}.meta.json");
+
+            string raw = VERSION + "v309_ml_locked" + MaxDepth + PressureLevels + d.SessionDate;
+            string hash = "";
+            using (SHA1 sha1 = SHA1.Create())
+            {
+                byte[] bytes = sha1.ComputeHash(Encoding.UTF8.GetBytes(raw));
+                StringBuilder builder = new StringBuilder();
+                for (int i = 0; i < bytes.Length; i++) builder.Append(bytes[i].ToString("x2"));
+                hash = builder.ToString();
+            }
+
             string json =
                 "{\n" +
                 $"  \"instrument\": \"{d.Symbol}\",\n" +
+                $"  \"session_hash\": \"{hash}\",\n" +
                 $"  \"utc_date\": \"{d.SessionDate}\",\n" +
                 $"  \"timezone\": \"UTC\",\n" +
                 $"  \"recorder_version\": \"{VERSION}\",\n" +
@@ -1945,7 +1979,7 @@ namespace NinjaTrader.NinjaScript.Indicators
                 {
                     long now = Stopwatch.GetTimestamp();
 
-                    // Patch 9: Stall Detector
+                    // Patch 9: Stall Detector & RECOVERY
                     long deltaMs = (now - lastLoopTicks) / ticksPerMs;
                     if (deltaMs > 10)
                     {
@@ -1954,6 +1988,23 @@ namespace NinjaTrader.NinjaScript.Indicators
                              if (fusedWriter != null)
                                 fusedWriter.WriteLine($"{{\"tag\":\"SYSTEM_STALL\",\"ts\":\"{NextGlobalUtc():O}\",\"stall_ms\":{deltaMs}}}");
                         } catch {}
+
+                        // [PHASE 2] HARD RESTART (>5s)
+                        if (deltaMs > 5000)
+                        {
+                            try {
+                                if (fusedWriter != null) {
+                                     fusedWriter.Flush();
+                                     fusedWriter.Close();
+                                }
+                            } catch {}
+                            fusedWriter = null;
+                            fusedReadSeq = GlobalSeq; // Drop to head
+                            OpenFusedFile();
+                            try {
+                                fusedWriter.WriteLine($"{{\"tag\":\"CONTROL\",\"type\":\"FUSED_RESTART\",\"reason\":\"stall_{deltaMs}ms\",\"ts\":\"{NextGlobalUtc():O}\"}}");
+                            } catch {}
+                        }
                     }
                     lastLoopTicks = now;
 
@@ -1980,7 +2031,17 @@ namespace NinjaTrader.NinjaScript.Indicators
                         // Maintenance checks while spinning
                         if (now - lastDiskFlushTicks > flushIntervalTicks)
                         {
-                            if (fusedWriter != null) fusedWriter.Flush();
+                            if (fusedWriter != null) {
+                                fusedWriter.Flush();
+                                // [PHASE 2] ROTATION
+                                if (fusedWriter.BaseStream.Length > 10L * 1024 * 1024 * 1024)
+                                {
+                                    fusedWriter.Close();
+                                    fusedWriter = null;
+                                    FusedPart++;
+                                    OpenFusedFile();
+                                }
+                            }
                             lastDiskFlushTicks = now;
                             OpenFusedFile();
                         }
@@ -2002,7 +2063,17 @@ namespace NinjaTrader.NinjaScript.Indicators
                     // Maintenance checks (post-write)
                     if (now - lastDiskFlushTicks > flushIntervalTicks)
                     {
-                        if (fusedWriter != null) fusedWriter.Flush();
+                        if (fusedWriter != null) {
+                            fusedWriter.Flush();
+                            // [PHASE 2] ROTATION
+                            if (fusedWriter.BaseStream.Length > 10L * 1024 * 1024 * 1024)
+                            {
+                                fusedWriter.Close();
+                                fusedWriter = null;
+                                FusedPart++;
+                                OpenFusedFile();
+                            }
+                        }
                         lastDiskFlushTicks = now;
                         OpenFusedFile();
                     }
@@ -2021,14 +2092,57 @@ namespace NinjaTrader.NinjaScript.Indicators
 
         private void HeartbeatLoop()
         {
+            DateTime lastHealthUtc = DateTime.MinValue;
+
             while (!heartbeatCts.Token.IsCancellationRequested)
             {
+                DateTime nowUtc = NextGlobalUtc();
+
+                // -----------------------------------------------------
+                // PHASE 0: SYSTEM TELEMETRY (Every 5s)
+                // -----------------------------------------------------
+                if ((nowUtc - lastHealthUtc).TotalSeconds >= 5)
+                {
+                    lastHealthUtc = nowUtc;
+                    long lag = GlobalSeq - fusedReadSeq;
+                    long hwm = Interlocked.Exchange(ref RingHighWater, 0); // Reset HWM
+                    long idle = (long)((Stopwatch.GetTimestamp() - fusedLastWriteTicks) * 1000.0 / Stopwatch.Frequency);
+                    long totalDrops = 0;
+                    long p95Max = 0;
+
+                    if (dom != null)
+                    {
+                        foreach (var d in dom)
+                        {
+                            if (d == null || !d.IsMonitoring) continue;
+                            totalDrops += d.StructuralDrops1s;
+                            d.StructuralDrops1s = 0; // Reset
+                            if (d.LatencyP95 > p95Max) p95Max = (long)d.LatencyP95;
+                        }
+                    }
+
+                    // PHASE 2: DISK GUARD
+                    try {
+                         // Only check if writing
+                         if (WriteFused && fusedWriter != null) {
+                             string drive = Path.GetPathRoot(NinjaTrader.Core.Globals.UserDataDir);
+                             DriveInfo di = new DriveInfo(drive);
+                             if (di.AvailableFreeSpace < 5L * 1024 * 1024 * 1024) { // 5GB
+                                  EmitControlEvent("SYSTEM", "DISK_LOW_STOP");
+                                  WriteFused = false; // Emergency Stop
+                             }
+                         }
+                    } catch {}
+
+                    EmitControlEvent("SYSTEM_HEALTH",
+                        $"lag={lag},hwm={hwm},fused_skips={Interlocked.Read(ref fusedGapSkips)},drops_1s={totalDrops},p95={p95Max},idle_ms={idle}");
+                }
+
                 if (dom != null)
                 {
                     foreach (var d in dom)
                     {
                         if (d == null || !d.IsMonitoring) continue;
-                        DateTime nowUtc = NextGlobalUtc();
                         if ((nowUtc - d.LastHeartbeatUtc).TotalSeconds >= HeartbeatSec && HeartbeatSec > 0)
                         {
                             d.LastHeartbeatUtc = nowUtc;
@@ -2071,6 +2185,10 @@ namespace NinjaTrader.NinjaScript.Indicators
             }
             while (Interlocked.CompareExchange(ref RingHighWater, lag, prev) != prev);
 
+            // Session Max Lag
+            long prevMax;
+            do { prevMax = MaxRingLag; if (lag <= prevMax) break; } while (Interlocked.CompareExchange(ref MaxRingLag, lag, prevMax) != prevMax);
+
             bool fusedLagging = WriteFused && (lag > RING_SIZE - 1000);
 
             if (d.SnapshotQueue.Count > HWM || fusedLagging) d.BackpressureTripped = true;
@@ -2108,6 +2226,7 @@ namespace NinjaTrader.NinjaScript.Indicators
             {
                 eventTime = d.LastExchTs;
                 d.ExchTsBackfillCount++;
+                d.ExchRegressCount++;
                 exchRegress = true;
             }
             d.LastExchTs = eventTime;
@@ -2957,11 +3076,8 @@ namespace NinjaTrader.NinjaScript.Indicators
             }
 
             // Enqueue after atomic allocation
-            bool enqueued = false;
             d.SnapshotQueue.Enqueue(p);
-            enqueued = true;
-            if (enqueued)
-                d.LastEventUtc = nowUtc;
+            d.LastEventUtc = nowUtc;
 
             if (eventTime > d.LastEmittedExchTs) d.LastEmittedExchTs = eventTime;
 
@@ -3088,8 +3204,14 @@ namespace NinjaTrader.NinjaScript.Indicators
                 if (today != fusedDate || fusedWriter == null)
                 {
                     if (fusedWriter != null) { fusedWriter.Flush(); fusedWriter.Close(); }
+
+                    if (today != fusedDate) FusedPart = 1;
                     fusedDate = today;
-                    string path = Path.Combine(baseDir, $"FUSED_{fusedDate}.jsonl");
+
+                    string fname = $"FUSED_{fusedDate}";
+                    if (FusedPart > 1) fname += $"_part{FusedPart}";
+                    string path = Path.Combine(baseDir, fname + ".jsonl");
+
                     bool isNew = !File.Exists(path);
                     // Patch 7: 1MB Buffer for High Throughput
                     fusedWriter = new StreamWriter(
