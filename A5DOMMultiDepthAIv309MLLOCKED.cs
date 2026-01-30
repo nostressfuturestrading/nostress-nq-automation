@@ -710,7 +710,7 @@ namespace NinjaTrader.NinjaScript.Indicators
         // -------------------------------------------------------------------------------------
         // PATCH 4: Ring Buffer (Zero GC, Deterministic Consumer)
         // -------------------------------------------------------------------------------------
-        private const int RING_SIZE = 65536;
+        private const int RING_SIZE = 262144; // 2^18 (Patch 6)
         private const int MASK = RING_SIZE - 1;
 
         private struct FusedEntry
@@ -1916,15 +1916,26 @@ namespace NinjaTrader.NinjaScript.Indicators
             d.LastIcebergFlag = 0;
         }
 
+        // [PATCH 9, 10, 11] Telemetry & Priority Logic
+        private static long RingHighWater = 0; // Global for Watermark
+
         private static void FusedWriterLoop()
         {
+            // Patch 11: Priority
+            Thread.CurrentThread.Priority = ThreadPriority.Highest;
+
             fusedLastHeartbeatTicks = Stopwatch.GetTimestamp();
             fusedLastWriteTicks = fusedLastHeartbeatTicks;
 
             if (fusedReadSeq == 0) fusedReadSeq = 1;
 
-            long flushIntervalTicks = (long)(0.010 * Stopwatch.Frequency);
+            long flushIntervalTicks = (long)(0.050 * Stopwatch.Frequency); // Relaxed to 50ms
             long lastDiskFlushTicks = Stopwatch.GetTimestamp();
+
+            // Telemetry Timers
+            long lastLoopTicks = Stopwatch.GetTimestamp();
+            long lastWatermarkTicks = Stopwatch.GetTimestamp();
+            long ticksPerMs = Stopwatch.Frequency / 1000;
 
             SpinWait spin = new SpinWait();
 
@@ -1933,6 +1944,30 @@ namespace NinjaTrader.NinjaScript.Indicators
                 try
                 {
                     long now = Stopwatch.GetTimestamp();
+
+                    // Patch 9: Stall Detector
+                    long deltaMs = (now - lastLoopTicks) / ticksPerMs;
+                    if (deltaMs > 10)
+                    {
+                        // We use Try-Catch here to ensure telemetry never crashes the writer
+                        try {
+                             if (fusedWriter != null)
+                                fusedWriter.WriteLine($"{{\"tag\":\"SYSTEM_STALL\",\"ts\":\"{NextGlobalUtc():O}\",\"stall_ms\":{deltaMs}}}");
+                        } catch {}
+                    }
+                    lastLoopTicks = now;
+
+                    // Patch 10: Ring Watermark (Emit every 5 seconds)
+                    if (now - lastWatermarkTicks > Stopwatch.Frequency * 5)
+                    {
+                        lastWatermarkTicks = now;
+                        long peak = Interlocked.Exchange(ref RingHighWater, 0);
+                        double pct = (double)peak / RING_SIZE * 100.0;
+                        try {
+                            if (fusedWriter != null)
+                                fusedWriter.WriteLine($"{{\"tag\":\"RING_WATERMARK\",\"ts\":\"{NextGlobalUtc():O}\",\"backlog\":{peak},\"pct\":{pct:F2}}}");
+                        } catch {}
+                    }
 
                     var idx = fusedReadSeq & MASK;
                     var entry = ring[idx];
@@ -2027,6 +2062,15 @@ namespace NinjaTrader.NinjaScript.Indicators
 
             // Check Ring Buffer lag
             long lag = GlobalSeq - fusedReadSeq;
+            // Patch 10: Atomic High Watermark Tracking
+            long prev;
+            do
+            {
+                prev = RingHighWater;
+                if (lag <= prev) break;
+            }
+            while (Interlocked.CompareExchange(ref RingHighWater, lag, prev) != prev);
+
             bool fusedLagging = WriteFused && (lag > RING_SIZE - 1000);
 
             if (d.SnapshotQueue.Count > HWM || fusedLagging) d.BackpressureTripped = true;
@@ -3047,7 +3091,12 @@ namespace NinjaTrader.NinjaScript.Indicators
                     fusedDate = today;
                     string path = Path.Combine(baseDir, $"FUSED_{fusedDate}.jsonl");
                     bool isNew = !File.Exists(path);
-                    fusedWriter = new StreamWriter(new FileStream(path, FileMode.Append, FileAccess.Write, FileShare.Read, 4096), new UTF8Encoding(false));
+                    // Patch 7: 1MB Buffer for High Throughput
+                    fusedWriter = new StreamWriter(
+                        new FileStream(path, FileMode.Append, FileAccess.Write, FileShare.Read, 1 << 20),
+                        new UTF8Encoding(false),
+                        1 << 20);
+                    fusedWriter.AutoFlush = false;
 
                     if(isNew) {
                          string header = $"{{\"tag\":\"metadata\",\"type\":\"header\",\"version\":\"A5_DOM_MultiDepth_AI_v309_ML_LOCKED\",\"date\":\"{fusedDate}\"}}";
