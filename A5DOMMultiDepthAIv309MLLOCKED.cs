@@ -1142,6 +1142,10 @@ namespace NinjaTrader.NinjaScript.Indicators
                         fusedInstanceCount++;
                         if (Interlocked.CompareExchange(ref fusedWriterRunning, 1, 0) == 0)
                         {
+                            // [FIX] Sync Reader to avoid deadlock on reload
+                            long currentGlobal = Interlocked.Read(ref GlobalSeq);
+                            fusedReadSeq = currentGlobal + 1;
+
                             fusedWriterCts = new CancellationTokenSource();
                             fusedWriterTask = Task.Run(() => FusedWriterLoop(), fusedWriterCts.Token);
                             NinjaTrader.Code.Output.Process("[A5] FUSED Writer Background Task Started.", PrintTo.OutputTab1);
@@ -1433,6 +1437,16 @@ namespace NinjaTrader.NinjaScript.Indicators
                 {
                     NinjaTrader.Code.Output.Process("[A5] FUSED stall detected — restarting writer", PrintTo.OutputTab1);
                     TryRestartFusedWriter();
+                }
+            }
+
+            // FIX: Ensure pending trades are processed even if DOM is not updating
+            int idx = BarsInProgress;
+            if (idx >= 0 && idx < dom.Length && dom[idx].IsMonitoring)
+            {
+                lock (dom[idx].Sync)
+                {
+                    ProcessPendingTrades(idx);
                 }
             }
         }
