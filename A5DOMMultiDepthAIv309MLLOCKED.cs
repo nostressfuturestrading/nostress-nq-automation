@@ -819,11 +819,11 @@ namespace NinjaTrader.NinjaScript.Indicators
                 var json = $"{{\"tag\":\"CONTROL\",\"inst\":\"{instName}\",\"type\":\"{type}\",\"reason\":\"{reason}\",\"global_seq\":{seq},\"ts\":\"{NextGlobalUtc():O}\"}}";
 
                 // PATCH 3 & 4: Fused Ring Buffer
-                ring[seq & MASK] = new FusedEntry {
-                    Json = json + "\n",
-                    Seq = seq,
-                    LocalTicks = Stopwatch.GetTimestamp()
-                };
+                var idx = seq & MASK;
+                ring[idx].Json = json + "\n";
+                Thread.MemoryBarrier();
+                ring[idx].Seq = seq;
+                ring[idx].LocalTicks = Stopwatch.GetTimestamp();
             }
         }
 
@@ -1082,12 +1082,11 @@ namespace NinjaTrader.NinjaScript.Indicators
                                     // Prevents bad data from poisoning the ring buffer
                                     if (WriteFused && bookReady && d.ValidBookCount >= 100 && p.Tag != Tags.HEARTBEAT)
                                     {
-                                        ring[p.GlobalSeq & MASK] = new FusedEntry
-                                        {
-                                            Json = jsonLine,
-                                            Seq = p.GlobalSeq,
-                                            LocalTicks = Stopwatch.GetTimestamp()
-                                        };
+                                        var idx = p.GlobalSeq & MASK;
+                                        ring[idx].Json = jsonLine;
+                                        Thread.MemoryBarrier();
+                                        ring[idx].Seq = p.GlobalSeq;
+                                        ring[idx].LocalTicks = Stopwatch.GetTimestamp();
                                     }
 
                                     d.Writer.Write(jsonLine);
@@ -1108,11 +1107,11 @@ namespace NinjaTrader.NinjaScript.Indicators
                                 {
                                     // [FIX] PATCH RING HOLE
                                     if (WriteFused && p.GlobalSeq > 0) {
-                                         ring[p.GlobalSeq & MASK] = new FusedEntry {
-                                             Json = $"{{\"tag\":\"ERROR\",\"seq\":{p.GlobalSeq},\"err\":\"{ex.Message}\"}}\n",
-                                             Seq = p.GlobalSeq,
-                                             LocalTicks = Stopwatch.GetTimestamp()
-                                         };
+                                         var idx = p.GlobalSeq & MASK;
+                                         ring[idx].Json = $"{{\"tag\":\"ERROR\",\"seq\":{p.GlobalSeq},\"err\":\"{ex.Message}\"}}\n";
+                                         Thread.MemoryBarrier();
+                                         ring[idx].Seq = p.GlobalSeq;
+                                         ring[idx].LocalTicks = Stopwatch.GetTimestamp();
                                     }
 
                                     d.ConsecutiveIoErrors++;
@@ -1165,7 +1164,7 @@ namespace NinjaTrader.NinjaScript.Indicators
                             fusedReadSeq = currentGlobal + 1;
 
                             fusedWriterCts = new CancellationTokenSource();
-                            fusedWriterTask = Task.Run(() => FusedWriterLoop(), fusedWriterCts.Token);
+                            fusedWriterTask = Task.Run(() => FusedWriterLoop(fusedWriterCts.Token), fusedWriterCts.Token);
                             NinjaTrader.Code.Output.Process("[A5] FUSED Writer Background Task Started.", PrintTo.OutputTab1);
                         }
                     }
@@ -1454,7 +1453,7 @@ namespace NinjaTrader.NinjaScript.Indicators
                     now - fusedLastWriteTicks > FUSED_STALL_TICKS)
                 {
                     NinjaTrader.Code.Output.Process("[A5] FUSED stall detected — restarting writer", PrintTo.OutputTab1);
-                    TryRestartFusedWriter();
+                    TryRestartFusedWriter("watchdog");
                 }
             }
 
@@ -1991,7 +1990,7 @@ namespace NinjaTrader.NinjaScript.Indicators
         // [PATCH 9, 10, 11] Telemetry & Priority Logic
         private static long RingHighWater = 0; // Global for Watermark
 
-        private static void FusedWriterLoop()
+        private static void FusedWriterLoop(CancellationToken token)
         {
             // Patch 11: Priority
             Thread.CurrentThread.Priority = ThreadPriority.Highest;
@@ -2010,8 +2009,10 @@ namespace NinjaTrader.NinjaScript.Indicators
             long ticksPerMs = Stopwatch.Frequency / 1000;
 
             SpinWait spin = new SpinWait();
+            int spinCount = 0;
+            const int MAX_SPINS = 6000;   // ~2–4ms WAN tolerant
 
-            while (!fusedWriterCts.IsCancellationRequested)
+            while (!token.IsCancellationRequested)
             {
                 try
                 {
@@ -2030,18 +2031,7 @@ namespace NinjaTrader.NinjaScript.Indicators
                         // [PHASE 2] HARD RESTART (>5s)
                         if (deltaMs > 5000)
                         {
-                            try {
-                                if (fusedWriter != null) {
-                                     fusedWriter.Flush();
-                                     fusedWriter.Close();
-                                }
-                            } catch {}
-                            fusedWriter = null;
-                            fusedReadSeq = GlobalSeq; // Drop to head
-                            OpenFusedFile();
-                            try {
-                                fusedWriter.WriteLine($"{{\"tag\":\"CONTROL\",\"type\":\"FUSED_RESTART\",\"reason\":\"stall_{deltaMs}ms\",\"ts\":\"{NextGlobalUtc():O}\"}}");
-                            } catch {}
+                            TryRestartFusedWriter($"stall_{deltaMs}ms");
                         }
                     }
                     lastLoopTicks = now;
@@ -2058,6 +2048,26 @@ namespace NinjaTrader.NinjaScript.Indicators
                         } catch {}
                     }
 
+                    // [FIX] Wait for data (Quiet Market)
+                    if (fusedReadSeq > Interlocked.Read(ref GlobalSeq))
+                    {
+                        if (now - lastDiskFlushTicks > flushIntervalTicks)
+                        {
+                            if (fusedWriter != null) {
+                                fusedWriter.Flush();
+                                if (fusedWriter.BaseStream.Length > 10L * 1024 * 1024 * 1024) {
+                                    fusedWriter.Close(); fusedWriter = null; FusedPart++; OpenFusedFile();
+                                }
+                            }
+                            lastDiskFlushTicks = now;
+                            OpenFusedFile();
+                        }
+                        spin.Reset();
+                        Thread.Sleep(1);
+                        spinCount = 0;
+                        continue;
+                    }
+
                     var idx = fusedReadSeq & MASK;
                     var entry = ring[idx];
 
@@ -2065,23 +2075,28 @@ namespace NinjaTrader.NinjaScript.Indicators
                     if (entry.Seq != fusedReadSeq)
                     {
                         spin.SpinOnce();
+                        spinCount++;
 
-                        // Maintenance checks while spinning
-                        if (now - lastDiskFlushTicks > flushIntervalTicks)
+                        if (spinCount > MAX_SPINS)
                         {
-                            if (fusedWriter != null) {
-                                fusedWriter.Flush();
-                                // [PHASE 2] ROTATION
-                                if (fusedWriter.BaseStream.Length > 10L * 1024 * 1024 * 1024)
-                                {
-                                    fusedWriter.Close();
-                                    fusedWriter = null;
-                                    FusedPart++;
-                                    OpenFusedFile();
-                                }
+                            // HARD GAP PATCH — missing seq
+                            long missing = fusedReadSeq;
+
+                            string gap = $"{{\"tag\":\"GAP\",\"seq\":{missing},\"ts\":\"{NextGlobalUtc():O}\"}}\n";
+
+                            try
+                            {
+                                if (fusedWriter == null) OpenFusedFile();
+                                fusedWriter.Write(gap);
                             }
-                            lastDiskFlushTicks = now;
-                            OpenFusedFile();
+                            catch {}
+
+                            Interlocked.Increment(ref fusedGapSkips);
+
+                            fusedReadSeq++;
+                            spinCount = 0;
+
+                            continue;
                         }
 
                         continue;
@@ -2098,6 +2113,8 @@ namespace NinjaTrader.NinjaScript.Indicators
                     if (fusedWriter == null) OpenFusedFile();
                     fusedWriter.Write(entry.Json);
                     fusedRowsWritten++;
+
+                    spinCount = 0;
 
                     // Ring Cleanup
                     ring[idx] = default(FusedEntry);
@@ -3285,27 +3302,50 @@ namespace NinjaTrader.NinjaScript.Indicators
             }
         }
 
-        private static void TryRestartFusedWriter()
+        private static void TryRestartFusedWriter(string reason)
         {
-            if (Interlocked.CompareExchange(ref fusedWriterRunning, 1, 0) != 0)
-                return;
-
-            try
+            lock (fusedRestartGate)
             {
-                fusedWriter?.Flush();
-                fusedWriter?.Dispose();
+                try
+                {
+                    NinjaTrader.Code.Output.Process($"[A5] FUSED HARD RESTART: {reason}", PrintTo.OutputTab1);
 
-                OpenFusedFile(); // your existing file init
+                    // Cancel existing writer
+                    try { fusedWriterCts?.Cancel(); } catch {}
 
-                fusedLastHeartbeatTicks = Stopwatch.GetTimestamp();
-                fusedLastWriteTicks = fusedLastHeartbeatTicks;
+                    // Join old task briefly
+                    try { fusedWriterTask?.Wait(2000); } catch {}
 
-                Task.Run(FusedWriterLoop);
-            }
-            catch (Exception ex)
-            {
-                NinjaTrader.Code.Output.Process("[A5] Restart failed: " + ex.Message, PrintTo.OutputTab1);
-                Interlocked.Exchange(ref fusedWriterRunning, 0);
+                    // Force reset
+                    fusedWriterRunning = 0;
+
+                    try
+                    {
+                        fusedWriter?.Flush();
+                        fusedWriter?.Close();
+                    }
+                    catch {}
+
+                    fusedWriter = null;
+
+                    // Drop to head (explicitly acknowledge data loss)
+                    long global = Interlocked.Read(ref GlobalSeq);
+                    fusedReadSeq = global;
+
+                    // New CTS + task
+                    fusedWriterCts = new CancellationTokenSource();
+
+                    fusedWriterTask = Task.Run(() =>
+                    {
+                        FusedWriterLoop(fusedWriterCts.Token);
+                    });
+
+                    Interlocked.Exchange(ref fusedWriterRunning, 1);
+                }
+                catch (Exception ex)
+                {
+                    NinjaTrader.Code.Output.Process($"[A5] FUSED RESTART FAILED: {ex.Message}", PrintTo.OutputTab1);
+                }
             }
         }
 
