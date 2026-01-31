@@ -784,15 +784,30 @@ namespace NinjaTrader.NinjaScript.Indicators
         private CancellationTokenSource heartbeatCts;
 
         // -------------------------------------------------------------------------------------
-        // PATCH 8: CONTROL EVENTS SEQUENCING
-        // Allocates GlobalSeq for control messages so they don't float in time
+        // PATCH 8: CONTROL EVENTS SEQUENCING (With V309 Fixes)
         // -------------------------------------------------------------------------------------
         private void EmitControlEvent(string type, string reason, bool force = false)
         {
-            // PATCH 1: Delay GlobalSeq Allocation Until After Repair Eligibility
             if (WriteFused)
             {
-                if (!force && (GlobalSeq - fusedReadSeq) >= RING_SIZE - 5000)
+                // [FIX 1 - REQUIRED] GATE BEHIND BOOKREADY
+                // Prevents Control messages from stealing Seq 1.
+                // Ensures strict data alignment for ML.
+                if (!bookReady)
+                    return;
+
+                // [FIX 2 - OPTIONAL] RECORD MAX RING LAG (Thread-Safe)
+                long lag = GlobalSeq - fusedReadSeq;
+                long prevMax;
+                do
+                {
+                    prevMax = MaxRingLag;
+                    if (lag <= prevMax) break;
+                }
+                while (Interlocked.CompareExchange(ref MaxRingLag, lag, prevMax) != prevMax);
+
+                // Backpressure Check
+                if (!force && lag >= RING_SIZE - 5000)
                 {
                     Interlocked.Increment(ref fusedDrops);
                     return;
