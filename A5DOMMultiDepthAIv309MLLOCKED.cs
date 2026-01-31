@@ -16,6 +16,7 @@ using NinjaTrader.Gui.Tools;
 using NinjaTrader.NinjaScript;
 using System.Diagnostics;
 using System.Security.Cryptography;
+using System.Runtime.InteropServices;
 #endregion
 
 // =======================================================================================
@@ -717,11 +718,12 @@ namespace NinjaTrader.NinjaScript.Indicators
         private const int RING_SIZE = 262144; // 2^18 (Patch 6)
         private const int MASK = RING_SIZE - 1;
 
+        [StructLayout(LayoutKind.Explicit, Size = 64)]
         private struct FusedEntry
         {
-            public string Json;
-            public long Seq;
-            public long LocalTicks;
+            [FieldOffset(0)] public string Json;
+            [FieldOffset(8)] public long Seq;
+            [FieldOffset(16)] public long LocalTicks;
         }
 
         private static FusedEntry[] ring = new FusedEntry[RING_SIZE];
@@ -782,12 +784,12 @@ namespace NinjaTrader.NinjaScript.Indicators
         // PATCH 8: CONTROL EVENTS SEQUENCING
         // Allocates GlobalSeq for control messages so they don't float in time
         // -------------------------------------------------------------------------------------
-        private void EmitControlEvent(string type, string reason)
+        private void EmitControlEvent(string type, string reason, bool force = false)
         {
             // PATCH 1: Delay GlobalSeq Allocation Until After Repair Eligibility
             if (WriteFused)
             {
-                if ((GlobalSeq - fusedReadSeq) >= RING_SIZE - 5000)
+                if (!force && (GlobalSeq - fusedReadSeq) >= RING_SIZE - 5000)
                 {
                     Interlocked.Increment(ref fusedDrops);
                     return;
@@ -1086,6 +1088,15 @@ namespace NinjaTrader.NinjaScript.Indicators
                                 }
                                 catch (Exception ex)
                                 {
+                                    // [FIX] PATCH RING HOLE
+                                    if (WriteFused && p.GlobalSeq > 0) {
+                                         ring[p.GlobalSeq & MASK] = new FusedEntry {
+                                             Json = $"{{\"tag\":\"ERROR\",\"seq\":{p.GlobalSeq},\"err\":\"{ex.Message}\"}}\n",
+                                             Seq = p.GlobalSeq,
+                                             LocalTicks = Stopwatch.GetTimestamp()
+                                         };
+                                    }
+
                                     d.ConsecutiveIoErrors++;
                                     if (d.ConsecutiveIoErrors > 10 && !d.CircuitBreakerTripped)
                                     {
@@ -2128,7 +2139,7 @@ namespace NinjaTrader.NinjaScript.Indicators
                              string drive = Path.GetPathRoot(NinjaTrader.Core.Globals.UserDataDir);
                              DriveInfo di = new DriveInfo(drive);
                              if (di.AvailableFreeSpace < 5L * 1024 * 1024 * 1024) { // 5GB
-                                  EmitControlEvent("SYSTEM", "DISK_LOW_STOP");
+                                  EmitControlEvent("SYSTEM", "DISK_LOW_STOP", force: true);
                                   WriteFused = false; // Emergency Stop
                              }
                          }
