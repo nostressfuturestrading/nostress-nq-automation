@@ -440,6 +440,9 @@ namespace NinjaTrader.NinjaScript.Indicators
             public Dictionary<double, SpoofCandidate> SpoofBid = new Dictionary<double, SpoofCandidate>();
             public Dictionary<double, SpoofCandidate> SpoofAsk = new Dictionary<double, SpoofCandidate>();
 
+            // [PATCH] Zero-Allocation Removal Buffer
+            public List<double> SpoofRemovalBuffer = new List<double>(32);
+
             public PendingTrade Pending = new PendingTrade();
 
             public long Seq;
@@ -1619,14 +1622,9 @@ namespace NinjaTrader.NinjaScript.Indicators
                     }
 
                     // [FIX] Use monotonic 'nowUtc' for feature updates
-                    if (!d.InBurst)
-                    {
-                        UpdateFeatureState(d, nowUtc, bestBid, bestAsk, tB, tA, sB, sA, currentOfi, currentDepthOfi);
-                    }
-                    else
-                    {
-                        // Burst reset logic...
-                    }
+                    // [PATCH] Update feature state regardless of burst status to maintain
+                    // continuity for derivatives (Slope/Accel), otherwise post-burst rows have invalid deltas.
+                    UpdateFeatureState(d, nowUtc, bestBid, bestAsk, tB, tA, sB, sA, currentOfi, currentDepthOfi);
 
                     if (UseSessionFilter && !sessionIterators[idx].IsInSession(nowUtc, true, true))
                     {
@@ -2074,6 +2072,13 @@ namespace NinjaTrader.NinjaScript.Indicators
                         continue;
                     }
 
+                    // [PATCH] Guard against non-atomic struct copy (Json ref might be null despite Seq match)
+                    if (entry.Json == null)
+                    {
+                        spin.SpinOnce();
+                        continue; // Wait for the Json pointer to become visible
+                    }
+
                     // Write
                     if (fusedWriter == null) OpenFusedFile();
                     fusedWriter.Write(entry.Json);
@@ -2293,7 +2298,8 @@ namespace NinjaTrader.NinjaScript.Indicators
                 return;
             }
 
-            long latency = (long)(nowUtc.Subtract(eventTime.ToUniversalTime()).TotalMilliseconds);
+            // [PATCH] Avoid ToUniversalTime() assumption (Ambiguous Kind)
+            long latency = (long)((nowUtc - eventTime).TotalMilliseconds);
 
             double bid = d.LastBidPx;
             double ask = d.LastAskPx;
@@ -3162,13 +3168,17 @@ namespace NinjaTrader.NinjaScript.Indicators
 
             if (map.Count > 0)
             {
-                var toRemove = new List<double>();
+                // [PATCH] Zero-Allocation Removal
+                d.SpoofRemovalBuffer.Clear();
                 foreach (var kv in map)
                 {
                     if ((nowUtc - kv.Value.AddUtc).TotalMilliseconds > SpoofWindowMs)
-                        toRemove.Add(kv.Key);
+                        d.SpoofRemovalBuffer.Add(kv.Key);
                 }
-                for (int i = 0; i < toRemove.Count; i++) map.Remove(toRemove[i]);
+
+                int cnt = d.SpoofRemovalBuffer.Count;
+                for (int i = 0; i < cnt; i++)
+                    map.Remove(d.SpoofRemovalBuffer[i]);
             }
 
             if (delta >= SpoofMinAddSize)
