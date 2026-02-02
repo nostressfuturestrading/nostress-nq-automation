@@ -773,7 +773,7 @@ namespace NinjaTrader.NinjaScript.Indicators
             {
                 var now = DateTime.UtcNow;
                 if (now <= GlobalLastUtc)
-                    now = GlobalLastUtc.AddTicks(1);
+                    now = GlobalLastUtc.AddTicks(10); // 1us increment for float64 safety
 
                 GlobalLastUtc = now;
                 return now;
